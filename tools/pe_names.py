@@ -16,7 +16,7 @@ if mode=='imp':
         oft,_,_,name,ft=struct.unpack_from('<IIIII',d,o)
         if name==0: break
         dll=cstr(r2o(name))
-        if 'steam' in dll.lower():
+        if 'steam' in dll.lower() or (len(sys.argv)>3 and sys.argv[3].lower() in dll.lower()):
             t=r2o(oft or ft)
             while True:
                 v=struct.unpack_from('<Q',d,t)[0]

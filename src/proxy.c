@@ -29,6 +29,7 @@ static char     g_dir[MAX_PATH];
 static char     g_room[40];
 static uint64_t g_partner;
 static int      g_log_on = 1;
+static int      g_debug = 1;
 static FILE    *g_log;
 static CRITICAL_SECTION g_log_cs;
 
@@ -67,6 +68,7 @@ static void load_config(HMODULE self)
     g_partner = _strtoui64(raw, NULL, 10);
 
     g_log_on = GetPrivateProfileIntA("coop", "log", 1, ini);
+    g_debug  = GetPrivateProfileIntA("coop", "debug", 1, ini);
     if (g_log_on) {
         InitializeCriticalSection(&g_log_cs);
         snprintf(logpath, sizeof logpath, "%sjourney-coop.log", g_dir);
@@ -208,9 +210,72 @@ static int8_t h_DeleteLobbyData(void *self, uint64_t lobby, const char *key)
     return o_DeleteLobbyData(self, lobby, map_key(key, 3));
 }
 
+// ---------------------------------------------------------------------------
+// Generic tracers: log every call the game makes on each vtable slot (first 3
+// calls, then on every power of two) and forward with all argument registers
+// plus 4 stack slots untouched. Specific hooks are installed on top of these.
+
+typedef uint64_t (*Any8_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+static const char *MM_NAMES[38] = {
+    "GetFavoriteGameCount", "GetFavoriteGame", "AddFavoriteGame", "RemoveFavoriteGame",
+    "RequestLobbyList", "AddRequestLobbyListStringFilter", "AddRequestLobbyListNumericalFilter",
+    "AddRequestLobbyListNearValueFilter", "AddRequestLobbyListFilterSlotsAvailable",
+    "AddRequestLobbyListDistanceFilter", "AddRequestLobbyListResultCountFilter",
+    "AddRequestLobbyListCompatibleMembersFilter", "GetLobbyByIndex", "CreateLobby", "JoinLobby",
+    "LeaveLobby", "InviteUserToLobby", "GetNumLobbyMembers", "GetLobbyMemberByIndex", "GetLobbyData",
+    "SetLobbyData", "GetLobbyDataCount", "GetLobbyDataByIndex", "DeleteLobbyData", "GetLobbyMemberData",
+    "SetLobbyMemberData", "SendLobbyChatMsg", "GetLobbyChatEntry", "RequestLobbyData",
+    "SetLobbyGameServer", "GetLobbyGameServer", "SetLobbyMemberLimit", "GetLobbyMemberLimit",
+    "SetLobbyType", "SetLobbyJoinable", "GetLobbyOwner", "SetLobbyOwner", "SetLinkedLobby",
+};
+static const char *NET_NAMES[22] = {
+    "SendP2PPacket", "IsP2PPacketAvailable", "ReadP2PPacket", "AcceptP2PSessionWithUser",
+    "CloseP2PSessionWithUser", "CloseP2PChannelWithUser", "GetP2PSessionState", "AllowP2PPacketRelay",
+    "CreateListenSocket", "CreateP2PConnectionSocket", "CreateConnectionSocket", "DestroySocket",
+    "DestroyListenSocket", "SendDataOnSocket", "IsDataAvailableOnSocket", "RetrieveDataFromSocket",
+    "IsDataAvailable", "RetrieveData", "GetSocketInfo", "GetListenSocketInfo",
+    "GetSocketConnectionType", "GetMaxPacketSize",
+};
+
+static void *g_mm_orig[38], *g_net_orig[22];
+static volatile LONG g_mm_cnt[38], g_net_cnt[22];
+
+static void trace(const char *iface, const char *name, volatile LONG *cnt)
+{
+    LONG n = InterlockedIncrement(cnt);
+    if (n <= 3 || (n & (n - 1)) == 0) logf_("call %s::%s (#%ld)", iface, name, n);
+}
+
+#define TR(kind, i)                                                                        \
+    static uint64_t tr_##kind##_##i(uint64_t a, uint64_t b, uint64_t c, uint64_t d,       \
+                                    uint64_t e, uint64_t f, uint64_t g, uint64_t h)       \
+    {                                                                                      \
+        trace(#kind, kind##_NAMES_U[i], &g_##kind##_cnt[i]);                               \
+        return ((Any8_t)g_##kind##_orig[i])(a, b, c, d, e, f, g, h);                       \
+    }
+#define mm_NAMES_U MM_NAMES
+#define net_NAMES_U NET_NAMES
+TR(mm, 0) TR(mm, 1) TR(mm, 2) TR(mm, 3) TR(mm, 4) TR(mm, 5) TR(mm, 6) TR(mm, 7) TR(mm, 8) TR(mm, 9) TR(mm, 10) TR(mm, 11) TR(mm, 12) TR(mm, 13) TR(mm, 14) TR(mm, 15) TR(mm, 16) TR(mm, 17) TR(mm, 18) TR(mm, 19) TR(mm, 20) TR(mm, 21) TR(mm, 22) TR(mm, 23) TR(mm, 24) TR(mm, 25) TR(mm, 26) TR(mm, 27) TR(mm, 28) TR(mm, 29) TR(mm, 30) TR(mm, 31) TR(mm, 32) TR(mm, 33) TR(mm, 34) TR(mm, 35) TR(mm, 36) TR(mm, 37)
+TR(net, 0) TR(net, 1) TR(net, 2) TR(net, 3) TR(net, 4) TR(net, 5) TR(net, 6) TR(net, 7) TR(net, 8) TR(net, 9) TR(net, 10) TR(net, 11) TR(net, 12) TR(net, 13) TR(net, 14) TR(net, 15) TR(net, 16) TR(net, 17) TR(net, 18) TR(net, 19) TR(net, 20) TR(net, 21)
+
+static void *MM_TR[38] = {
+    tr_mm_0, tr_mm_1, tr_mm_2, tr_mm_3, tr_mm_4, tr_mm_5, tr_mm_6, tr_mm_7, tr_mm_8, tr_mm_9,
+    tr_mm_10, tr_mm_11, tr_mm_12, tr_mm_13, tr_mm_14, tr_mm_15, tr_mm_16, tr_mm_17, tr_mm_18, tr_mm_19,
+    tr_mm_20, tr_mm_21, tr_mm_22, tr_mm_23, tr_mm_24, tr_mm_25, tr_mm_26, tr_mm_27, tr_mm_28, tr_mm_29,
+    tr_mm_30, tr_mm_31, tr_mm_32, tr_mm_33, tr_mm_34, tr_mm_35, tr_mm_36, tr_mm_37,
+};
+static void *NET_TR[22] = {
+    tr_net_0, tr_net_1, tr_net_2, tr_net_3, tr_net_4, tr_net_5, tr_net_6, tr_net_7, tr_net_8, tr_net_9,
+    tr_net_10, tr_net_11, tr_net_12, tr_net_13, tr_net_14, tr_net_15, tr_net_16, tr_net_17, tr_net_18,
+    tr_net_19, tr_net_20, tr_net_21,
+};
+
 static void hook_matchmaking(void *mm)
 {
+    static int done; if (done) return; done = 1;
     void **v = *(void ***)mm;
+    for (int i = 0; i < 38; ++i) patch(v, i, MM_TR[i], &g_mm_orig[i]);
     patch(v, MM_RequestLobbyList,   (void *)h_RequestLobbyList,   (void **)&o_RequestLobbyList);
     patch(v, MM_AddStringFilter,    (void *)h_AddStringFilter,    (void **)&o_AddStringFilter);
     patch(v, MM_AddNumericalFilter, (void *)h_AddNumericalFilter, (void **)&o_AddNumericalFilter);
@@ -281,7 +346,9 @@ static int8_t h_AcceptP2P(void *self, uint64_t id)
 
 static void hook_networking(void *net)
 {
+    static int done; if (done) return; done = 1;
     void **v = *(void ***)net;
+    for (int i = 0; i < 22; ++i) patch(v, i, NET_TR[i], &g_net_orig[i]);
     patch(v, NET_Send,   (void *)h_SendP2P,   (void **)&o_SendP2P);
     patch(v, NET_Read,   (void *)h_ReadP2P,   (void **)&o_ReadP2P);
     patch(v, NET_Accept, (void *)h_AcceptP2P, (void **)&o_AcceptP2P);
@@ -312,6 +379,54 @@ static void *h_GetNet(void *self, int32_t user, int32_t pipe, const char *ver)
 }
 
 // ---------------------------------------------------------------------------
+// Capture the game's own debug output (OutputDebugStringA) into our log, so we
+// can see Journey's internal "MatchMaking::..." / "Matchmaker::..." messages.
+
+typedef void (WINAPI *ODS_t)(LPCSTR);
+static ODS_t o_ODS;
+
+
+static void WINAPI h_ODS(LPCSTR s)
+{
+    if (s && g_log) {
+        char line[1024];
+        size_t n = strlen(s);
+        if (n >= sizeof line) n = sizeof line - 1;
+        memcpy(line, s, n);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) --n;
+        line[n] = 0;
+        if (n) logf_("game| %s", line);
+    }
+    if (o_ODS) o_ODS(s);
+}
+
+static void hook_iat(HMODULE mod, const char *dll, const char *fn, void *hook, void **orig)
+{
+    BYTE *base = (BYTE *)mod;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return;
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; ++d) {
+        if (_stricmp((char *)(base + d->Name), dll) != 0) continue;
+        IMAGE_THUNK_DATA *names = (IMAGE_THUNK_DATA *)(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+        IMAGE_THUNK_DATA *iat   = (IMAGE_THUNK_DATA *)(base + d->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++iat) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            IMAGE_IMPORT_BY_NAME *ibn = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
+            if (strcmp((char *)ibn->Name, fn) != 0) continue;
+            DWORD old;
+            VirtualProtect(&iat->u1.Function, sizeof(void *), PAGE_READWRITE, &old);
+            *orig = (void *)iat->u1.Function;
+            iat->u1.Function = (ULONG_PTR)hook;
+            VirtualProtect(&iat->u1.Function, sizeof(void *), old, &old);
+            logf_("IAT hook %s!%s ok", dll, fn);
+            return;
+        }
+    }
+    logf_("IAT hook %s!%s not found", dll, fn);
+}
+
+// ---------------------------------------------------------------------------
 // exported entry point (see steam_api64.def)
 
 typedef void *(*CreateInterface_t)(const char *);
@@ -326,6 +441,12 @@ __declspec(dllexport) void *Proxy_SteamInternal_CreateInterface(const char *ver)
         if (!h) h = LoadLibraryA(path);
         if (h) o_CreateInterface = (CreateInterface_t)GetProcAddress(h, "SteamInternal_CreateInterface");
         if (!o_CreateInterface) { logf_("FATAL: steam_api64_o.dll not found"); return NULL; }
+    }
+    static int iat_done;
+    if (!iat_done) {
+        iat_done = 1;
+        if (g_debug && g_log)
+            hook_iat(GetModuleHandleA(NULL), "KERNEL32.dll", "OutputDebugStringA", (void *)h_ODS, (void **)&o_ODS);
     }
     void *r = o_CreateInterface(ver);
     logf_("CreateInterface(%s) -> %p", ver ? ver : "?", r);

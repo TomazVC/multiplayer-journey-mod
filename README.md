@@ -50,6 +50,7 @@ Testado com `Journey.exe` sha256 `16a7c176…788f` e `steam_api64.dll` sha256 `3
 
 ## Versões
 
+- **v0.3.1**: quando o jogo encerra a sessão com o parceiro (por exemplo, na troca de capítulo), o mod reseta também a sessão Steam e reaquece a rota na hora. Isso resolve a reconexão de mão única no capítulo 2. O log passa a mostrar quantos pacotes de jogo foram enviados e recebidos em cada sessão.
 - **v0.3.0**: mantém uma rota P2P **permanente** com o parceiro, com um ping por segundo no canal 7. Assim, conexões de longa distância (Brasil ↔ Itália) não estouram mais o limite de ~20 s do jogo. O SteamID do parceiro é descoberto sozinho e salvo no ini. O mod também emula para o jogo a abertura e o fechamento das sessões com o parceiro.
 - **v0.2.1**: o instalador também aumenta os timeouts de rede do jogo no `Vars.lua`. A conexão passa de 20 para 60 s, a troca de fase de 10 para 30 s e os pedidos de lobby de 20 para 60 s.
 - **v0.2.0**: corrige a conexão de mão única em longa distância (ex.: Brasil ↔ Itália). Enquanto o parceiro ainda não respondeu, os pacotes vão como *reliable*, então a Steam guarda e entrega quando a rota P2P fica pronta. O log também registra a latência e o motivo de cada desconexão.

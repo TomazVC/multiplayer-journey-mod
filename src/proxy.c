@@ -358,6 +358,31 @@ typedef struct { uint64_t from; uint32_t n; int ch; uint8_t *data; } QPkt;
 static QPkt g_q[QMAX];
 static int  g_qn;
 
+// per game-session counters (game channels only), for the log
+static uint32_t g_s_sent, g_s_recv;
+static DWORD    g_s_open, g_s_first_recv;
+static int      g_s_checked;
+
+static void session_open(const char *how)
+{
+    g_s_sent = g_s_recv = 0;
+    g_s_open = GetTickCount();
+    g_s_first_recv = 0;
+    g_s_checked = 0;
+    logf_("game %s partner session OPEN (link %s, %d packets waiting)", how,
+          g_link_up ? "warm" : "NOT warm yet", g_qn);
+}
+
+static void session_count_recv(void)
+{
+    ++g_s_recv;
+    if (!g_s_first_recv) {
+        g_s_first_recv = GetTickCount();
+        logf_("session: first game packet from partner after %lu ms", (unsigned long)(g_s_first_recv - g_s_open));
+    }
+}
+
+
 static int looks_like_steamid(uint64_t v) { return (v >> 52) == 0x011 && (uint32_t)v != 0; }
 
 #define MAX_SEEN 16
@@ -568,6 +593,11 @@ static void pump(void)
             logf_("link: ping %lu ms", (unsigned long)(now - m.t));
         }
     }
+    if (g_game_state == GAME_ACTIVE && !g_s_checked && now - g_s_open > 10000) {
+        g_s_checked = 1;
+        logf_("session +10s: game sent %u packets, received %u%s", g_s_sent, g_s_recv,
+              g_s_recv ? "" : "  <-- partner's game packets are NOT arriving");
+    }
     if (g_link_up && now - g_last_heard > 8000) {
         g_link_up = 0;
         logf_("link DOWN (no ping for 8 s, partner closed the game or network trouble); retrying");
@@ -633,8 +663,9 @@ static int8_t h_SendP2P(void *self, uint64_t to, const void *data, uint32_t n, i
     if (!g_partner) set_partner(to, "game connecting to it");
     if (to == g_partner && g_game_state != GAME_ACTIVE) {
         g_game_state = GAME_ACTIVE;
-        logf_("game -> partner session OPEN (game is calling; link %s)", g_link_up ? "warm" : "NOT warm yet");
+        session_open("->");
     }
+    if (to == g_partner && ch != LINK_CH) ++g_s_sent;
     LeaveCriticalSection(&g_net_cs);
     return R_SEND(to, data, n, type, ch);
 }
@@ -665,6 +696,7 @@ static int8_t h_ReadP2P(void *self, void *buf, uint32_t cb, uint32_t *size, uint
         *size = n;
         *from = g_q[i].from;
         q_drop(i);
+        session_count_recv();
         LeaveCriticalSection(&g_net_cs);
         return 1;
     }
@@ -674,7 +706,14 @@ static int8_t h_ReadP2P(void *self, void *buf, uint32_t cb, uint32_t *size, uint
         int8_t ok = R_READ(buf, cb, size, from, ch);
         if (!ok) return ok;
         note_peer(*from, "connected");
-        if (allowed(*from)) return ok;
+        if (allowed(*from)) {
+            if (g_partner && *from == g_partner) {
+                EnterCriticalSection(&g_net_cs);
+                session_count_recv();
+                LeaveCriticalSection(&g_net_cs);
+            }
+            return ok;
+        }
         // drop stranger packet and try the next one
     }
     return 0;
@@ -689,8 +728,7 @@ static int8_t h_AcceptP2P(void *self, uint64_t id)
     if (!allowed(id)) { LeaveCriticalSection(&g_net_cs); return 0; }
     if (id == g_partner && g_game_state != GAME_ACTIVE) {
         g_game_state = GAME_ACTIVE;
-        logf_("game <- partner session OPEN (game accepted; link %s, %d packets waiting)",
-              g_link_up ? "warm" : "NOT warm yet", g_qn);
+        session_open("<-");
     }
     LeaveCriticalSection(&g_net_cs);
     return R_ACCEPT(id);
@@ -700,13 +738,25 @@ static int8_t h_CloseP2P(void *self, uint64_t id)
 {
     EnterCriticalSection(&g_net_cs);
     if (g_partner && id == g_partner) {
-        if (g_game_state == GAME_ACTIVE)
-            logf_("game closed its session with partner (Steam link kept open, %s)",
-                  g_link_up ? "link up" : "link down");
+        int was_active = g_game_state == GAME_ACTIVE;
+        DWORD now = GetTickCount();
+        if (was_active)
+            logf_("game closed its session with partner after %lu s (game sent %u, received %u packets)",
+                  (unsigned long)((now - g_s_open) / 1000), g_s_sent, g_s_recv);
         g_game_state = GAME_IDLE;
         g_notified = 0;
-        g_closed_at = GetTickCount();
+        g_closed_at = now;
         q_clear();
+        if (was_active) {
+            // Reset the Steam session too, like the original game does: a fresh
+            // session means a fresh reliable stream (an old, stuck stream was
+            // blocking our packets after a chapter change). The link pings reopen
+            // it within a second, so the route warms again before the next call.
+            ((CloseP2P_t)g_net_orig[NET_Close])(g_net, id);
+            g_link_up = 0;
+            g_last_ping = 0;
+            logf_("Steam session with partner reset; link re-warming");
+        }
         LeaveCriticalSection(&g_net_cs);
         return 1;
     }

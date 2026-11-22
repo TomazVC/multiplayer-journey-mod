@@ -77,7 +77,7 @@ log=1
     Write-Ok "room=$Room  partner=$Partner"
 
     if (-not $NoVarsTweak) {
-        Write-Step 'Aumentando o raio de encontro (Data\Scripts\Vars.lua)'
+        Write-Step 'Aumentando raio de encontro e tempo de conexao (Data\Scripts\Vars.lua)'
         $vars = Join-Path $game 'Data\Scripts\Vars.lua'
         $varsBak = Join-Path $backup 'Vars.lua'
         if (Test-Path $vars) {
@@ -87,6 +87,10 @@ log=1
             $n = [regex]::Replace($n, '(kJoinRadiusFar\s*=\s*)[\d.]+', '${1}5000')
             $n = [regex]::Replace($n, '(kJoinRadiusNear\s*=\s*)[\d.]+', '${1}5000')
             $n = [regex]::Replace($n, '(kLeaveRadius\s*=\s*)[\d.]+', '${1}10000')
+            # Longer network timeouts: long-distance Steam P2P can take 10-15 s to set up
+            $n = [regex]::Replace($n, '(\bkTimeoutTime\s*=\s*)[\d.]+', '${1}60')
+            $n = [regex]::Replace($n, '(kLevelChangeTimeoutTime\s*=\s*)[\d.]+', '${1}30')
+            $n = [regex]::Replace($n, '(kDefaultRequestTimeout\s*=\s*)[\d.]+', '${1}60000000')
             if ($n -ne $t) { [System.IO.File]::WriteAllText($vars, $n); Write-Ok 'raios aumentados (backup em journey-coop-backup\Vars.lua)' }
             else { Write-Ok 'ja estava ajustado' }
         } else { Write-Warn2 'Vars.lua nao encontrado, pulando' }

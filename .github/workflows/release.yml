@@ -19,7 +19,7 @@ jobs:
         with:
           version: 0.17.1
       - run: sudo apt-get install -y zip
-      - run: ./build.sh
+      - run: sh ./build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: journey-coop

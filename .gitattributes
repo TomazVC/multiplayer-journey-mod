@@ -1,0 +1,4 @@
+*.cmd eol=crlf
+*.ps1 eol=crlf
+*.txt eol=crlf
+*.sh eol=lf

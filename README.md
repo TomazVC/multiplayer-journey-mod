@@ -20,7 +20,7 @@ O mod é um proxy da `steam_api64.dll`. A original é renomeada para `steam_api6
 | Interface | O que o mod faz |
 |---|---|
 | `ISteamMatchmaking` (009) | Renomeia toda chave de lobby que o jogo usa para `jc<SALA>_<chave>`. Também grava `jcoop_room=<SALA>` e filtra as buscas por essa chave, com distância *worldwide*. Resultado: desconhecidos não veem a sala de vocês, e vocês não veem a deles. |
-| `ISteamNetworking` (005) | É opcional (`partner=` no ini). Descarta P2P de qualquer SteamID que não seja o do parceiro e registra no log os SteamIDs vistos. |
+| `ISteamNetworking` (005) | Mantém uma rota P2P permanente e aquecida com o parceiro (ping/pong no canal 7), para a conexão do jogo abrir na hora mesmo em longa distância. O SteamID do parceiro é descoberto pela sala e salvo em `partner=`. Depois disso, P2P de outros SteamIDs é descartado. Como a sessão Steam fica sempre aberta, o mod emula para o jogo os callbacks `P2PSessionRequest`/`P2PSessionConnectFail` e o fechamento de sessão com o parceiro. |
 
 O instalador também ajusta `Data/Scripts/Vars.lua`. Ele aumenta os raios de encontro (`kJoinRadiusFar/Near`, `kLeaveRadius`), para a dupla se conectar logo ao entrar na fase e não se separar por distância. E aumenta os timeouts de rede (`ConnectionBarn.kTimeoutTime` 60 s, `kLevelChangeTimeoutTime` 30 s, `Matchmaker.kDefaultRequestTimeout` 60 s), para conexões de longa distância terem tempo de se estabelecer. O arquivo original fica salvo em `journey-coop-backup/`.
 
@@ -50,6 +50,7 @@ Testado com `Journey.exe` sha256 `16a7c176…788f` e `steam_api64.dll` sha256 `3
 
 ## Versões
 
+- **v0.3.0**: mantém uma rota P2P **permanente** com o parceiro, com um ping por segundo no canal 7. Assim, conexões de longa distância (Brasil ↔ Itália) não estouram mais o limite de ~20 s do jogo. O SteamID do parceiro é descoberto sozinho e salvo no ini. O mod também emula para o jogo a abertura e o fechamento das sessões com o parceiro.
 - **v0.2.1**: o instalador também aumenta os timeouts de rede do jogo no `Vars.lua`. A conexão passa de 20 para 60 s, a troca de fase de 10 para 30 s e os pedidos de lobby de 20 para 60 s.
 - **v0.2.0**: corrige a conexão de mão única em longa distância (ex.: Brasil ↔ Itália). Enquanto o parceiro ainda não respondeu, os pacotes vão como *reliable*, então a Steam guarda e entrega quando a rota P2P fica pronta. O log também registra a latência e o motivo de cada desconexão.
 - **v0.1.1**: diagnóstico. O log registra as mensagens do jogo e cada chamada de matchmaking e rede.

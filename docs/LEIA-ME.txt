@@ -64,9 +64,12 @@ SE NAO SE ENCONTRAREM
 5. Se a Steam atualizou o jogo ou voce usou "Verificar integridade",
    o mod foi removido: rode install.cmd de novo.
 
-Extra (opcional): o log mostra o SteamID64 do parceiro. Coloquem
-esse numero em partner= no journey-coop.ini para que o jogo recuse
-qualquer outra pessoa.
+Parceiro: na primeira vez que voces se encontram na sala, o mod
+descobre o SteamID do amigo e salva em partner= no journey-coop.ini.
+Dali em diante ele mantem uma conexao "aquecida" com o amigo desde
+que o jogo abre (no log: "link UP with partner"), o que deixa a
+conexao instantanea mesmo de longe. Para jogar com OUTRA pessoa,
+apague o numero (partner=0) e combinem um codigo de sala novo.
 
 
 DESINSTALAR

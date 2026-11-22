@@ -9,8 +9,9 @@
 //      theirs, so the only possible companion is someone using the same room code.
 //   2. Tags our lobbies with jcoop_room=<ROOM> and filters searches on it
 //      (worldwide distance), as a second fence.
-//   3. Optionally (partner=<SteamID64> in the ini) drops P2P traffic from anyone
-//      that is not the partner.
+//   3. Learns the partner's SteamID (saved as partner= in the ini), drops P2P
+//      traffic from anyone else, and keeps a permanent warm P2P link with the
+//      partner so long-distance connections don't time out (see networking part).
 //
 // Everything else is forwarded untouched through the .def file.
 
@@ -32,7 +33,8 @@ static int      g_log_on = 1;
 static int      g_debug = 1;
 static FILE    *g_log;
 static CRITICAL_SECTION g_log_cs;
-static CRITICAL_SECTION g_peer_cs;
+static CRITICAL_SECTION g_net_cs;
+static char     g_ini[MAX_PATH + 32];
 
 static void logf_(const char *fmt, ...)
 {
@@ -49,13 +51,14 @@ static void logf_(const char *fmt, ...)
 static void load_config(HMODULE self)
 {
     InitializeCriticalSection(&g_log_cs);
-    InitializeCriticalSection(&g_peer_cs);
+    InitializeCriticalSection(&g_net_cs);
     GetModuleFileNameA(self, g_dir, MAX_PATH);
     char *slash = strrchr(g_dir, '\\');
     if (slash) slash[1] = 0;
 
-    char ini[MAX_PATH + 32], raw[128], logpath[MAX_PATH + 32];
-    snprintf(ini, sizeof ini, "%sjourney-coop.ini", g_dir);
+    char raw[128], logpath[MAX_PATH + 32];
+    char *ini = g_ini;
+    snprintf(g_ini, sizeof g_ini, "%sjourney-coop.ini", g_dir);
 
     GetPrivateProfileStringA("coop", "room", "", raw, sizeof raw, ini);
     // keep only [A-Za-z0-9], uppercase, max 32 chars
@@ -273,6 +276,8 @@ static void *NET_TR[22] = {
     tr_net_19, tr_net_20, tr_net_21,
 };
 
+static uint64_t h_GetLobbyMember(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
 static void hook_matchmaking(void *mm)
 {
     static int done; if (done) return; done = 1;
@@ -288,21 +293,72 @@ static void hook_matchmaking(void *mm)
     patch(v, MM_GetLobbyData,       (void *)h_GetLobbyData,       (void **)&o_GetLobbyData);
     patch(v, MM_SetLobbyData,       (void *)h_SetLobbyData,       (void **)&o_SetLobbyData);
     patch(v, MM_DeleteLobbyData,    (void *)h_DeleteLobbyData,    (void **)&o_DeleteLobbyData);
+    void *dummy;
+    patch(v, 18 /* GetLobbyMemberByIndex */, (void *)h_GetLobbyMember, &dummy);
     logf_("ISteamMatchmaking hooked");
 }
 
 // ---------------------------------------------------------------------------
-// ISteamNetworking (SteamNetworking005) hooks
+// ISteamNetworking (SteamNetworking005) + the permanent partner link
+//
+// Problem seen between Brazil and Italy: a fresh Steam P2P route takes 14-20 s
+// to come up in one direction, and Journey gives up on a connection after ~20 s
+// without hearing back. Result: one player sees the other, the other sees nobody.
+//
+// Fix: keep our OWN Steam P2P session with the partner open all the time, with a
+// small ping/pong once per second on a private channel (LINK_CH). The route is
+// then always warm, so when the game connects its packets flow at once.
+//
+// Keeping the session open changes what Steam tells the game, so the mod
+// emulates the normal behaviour for the partner:
+//   * the game "closing" the session only marks it closed for the game
+//     (the Steam session, and the warm route, stay up);
+//   * while the game considers the partner disconnected, the partner's game
+//     packets are held back, and the game gets a synthesized
+//     P2PSessionRequest_t exactly like Steam would send for a new session;
+//   * Steam session requests / connect failures for the partner are handled by
+//     the mod and not shown to the game while it isn't connected to the partner.
+//
+// The partner's SteamID is learned from the lobby (only our pair can be in a
+// room with our code) or from the first P2P contact, and saved to the ini so the
+// next launch warms the link right away.
 
-enum { NET_Send = 0, NET_Read = 2, NET_Accept = 3 };
+enum { NET_Send = 0, NET_Avail = 1, NET_Read = 2, NET_Accept = 3, NET_Close = 4 };
+#define LINK_CH 7
+#define GAME_CHANNELS 4           // game channels the mod holds back while idle (0..3)
+#define QMAX 512
 
 typedef int8_t (*SendP2P_t)(void *, uint64_t, const void *, uint32_t, int, int);
+typedef int8_t (*AvailP2P_t)(void *, uint32_t *, int);
 typedef int8_t (*ReadP2P_t)(void *, void *, uint32_t, uint32_t *, uint64_t *, int);
 typedef int8_t (*AcceptP2P_t)(void *, uint64_t);
+typedef int8_t (*CloseP2P_t)(void *, uint64_t);
 
-static SendP2P_t   o_SendP2P;
-static ReadP2P_t   o_ReadP2P;
-static AcceptP2P_t o_AcceptP2P;
+static void *g_net;               // the ISteamNetworking005 object
+static void *g_client;            // the ISteamClient017 object
+static uint64_t g_self;           // our own SteamID64 (0 = unknown yet)
+static int g_abi_hidden = -1;     // 1 = CSteamID returned through hidden pointer (MSVC member ABI)
+
+#define R_SEND(to, d, n, t, ch)       ((SendP2P_t)g_net_orig[NET_Send])(g_net, to, d, n, t, ch)
+#define R_AVAIL(sz, ch)               ((AvailP2P_t)g_net_orig[NET_Avail])(g_net, sz, ch)
+#define R_READ(b, cb, sz, from, ch)   ((ReadP2P_t)g_net_orig[NET_Read])(g_net, b, cb, sz, from, ch)
+#define R_ACCEPT(id)                  ((AcceptP2P_t)g_net_orig[NET_Accept])(g_net, id)
+
+static CRITICAL_SECTION g_net_cs; // guards everything below
+
+enum { GAME_IDLE = 0, GAME_ACTIVE = 1 };
+static int   g_game_state = GAME_IDLE; // the game's view of its session with the partner
+static int   g_notified;               // synthesized request already given since idle
+static DWORD g_notified_at;
+static DWORD g_closed_at;              // when the game last closed the partner session
+static int   g_link_up;
+static DWORD g_last_ping, g_last_heard, g_last_rtt_log, g_link_since;
+
+typedef struct { uint64_t from; uint32_t n; int ch; uint8_t *data; } QPkt;
+static QPkt g_q[QMAX];
+static int  g_qn;
+
+static int looks_like_steamid(uint64_t v) { return (v >> 52) == 0x011 && (uint32_t)v != 0; }
 
 #define MAX_SEEN 16
 static uint64_t g_seen[MAX_SEEN];
@@ -321,40 +377,251 @@ static void note_peer(uint64_t id, const char *what)
 
 static int allowed(uint64_t id) { return !g_partner || id == g_partner; }
 
-// --- link warm-up -----------------------------------------------------------
-// Long-distance Steam P2P (e.g. Brazil <-> Italy) can take 10-15 s before the
-// route is up. Unreliable packets sent in that window can be thrown away, so the
-// game's handshake reply never reaches the other side and its ~20 s timeout
-// drops the connection (one side sees the other, the other sees nobody).
-// Fix: until we have received something from a peer, every packet to it is sent
-// Reliable (Steam queues it and delivers once the route is up). "NoDelay" sends,
-// which Steam discards when the route isn't ready, become plain Unreliable.
-
-enum { P2P_Unreliable = 0, P2P_UnreliableNoDelay = 1, P2P_Reliable = 2, P2P_ReliableBuffered = 3 };
-#define WARMUP_MAX_MS 60000
-
-typedef struct { uint64_t id; DWORD first_send, first_recv; uint32_t upgraded; } Peer;
-static Peer g_peers[8];
-
-
-static Peer *peer_get(uint64_t id)
+static void set_partner(uint64_t id, const char *how)
 {
-    Peer *free_slot = NULL;
-    for (int i = 0; i < 8; ++i) {
-        if (g_peers[i].id == id) return &g_peers[i];
-        if (!g_peers[i].id && !free_slot) free_slot = &g_peers[i];
-    }
-    if (!free_slot) { free_slot = &g_peers[0]; }
-    memset(free_slot, 0, sizeof *free_slot);
-    free_slot->id = id;
-    return free_slot;
+    if (g_partner || !looks_like_steamid(id) || id == g_self) return;
+    g_partner = id;
+    char v[32];
+    snprintf(v, sizeof v, "%llu", (unsigned long long)id);
+    WritePrivateProfileStringA("coop", "partner", v, g_ini);
+    logf_("partner learned (%s): SteamID64 %llu -> saved to journey-coop.ini, permanent link starts now",
+          how, (unsigned long long)id);
 }
 
+// --- held-back packet queue -------------------------------------------------
+
+static int q_find(int ch)
+{
+    for (int i = 0; i < g_qn; ++i) if (g_q[i].ch == ch) return i;
+    return -1;
+}
+
+static void q_drop(int i)
+{
+    free(g_q[i].data);
+    memmove(&g_q[i], &g_q[i + 1], (size_t)(g_qn - i - 1) * sizeof g_q[0]);
+    --g_qn;
+}
+
+static void q_clear(void) { while (g_qn) q_drop(g_qn - 1); }
+
+// --- Steam callbacks (P2PSessionRequest_t 1202, P2PSessionConnectFail_t 1203) --
+// CCallbackBase layout (MSVC x64): vtable, uint8 flags @8, int iCallback @12.
+// vtable: [0] Run(param, bool, SteamAPICall_t) [1] Run(param) [2] GetCallbackSizeBytes()
+// (for CCallback both Run overloads do the same thing).
+
+typedef struct CCB { void **vtbl; uint8_t flags; int icb; } CCB;
+typedef void (*RegCB_t)(void *, int);
+typedef void (*UnregCB_t)(void *);
+typedef void (*RunCB_t)(void *, void *, uint64_t, uint64_t);
+
+static CCB *g_game_req_cb, *g_game_fail_cb;
+static CCB  g_my_req_cb, g_my_fail_cb;
+
+static void game_cb_run(CCB *cb, void *param)
+{
+    if (cb) ((RunCB_t)cb->vtbl[1])(cb, param, 0, 0);
+}
+
+static void cb_req_run(CCB *self, void *param, uint64_t a, uint64_t b)
+{
+    (void)self; (void)a; (void)b;
+    uint64_t id = *(uint64_t *)param;
+    if (!g_net) { game_cb_run(g_game_req_cb, param); return; }
+    EnterCriticalSection(&g_net_cs);
+    if (!g_partner) set_partner(id, "incoming P2P");
+    int partner = g_partner && id == g_partner;
+    int active = g_game_state == GAME_ACTIVE;
+    LeaveCriticalSection(&g_net_cs);
+    if (partner) {
+        R_ACCEPT(id); // keep the route; the game is told later, when its own packets arrive
+        logf_("link: Steam session request from partner, accepted by the mod (game %s)",
+              active ? "connected -> forwarded" : "not connected -> held");
+        if (active) game_cb_run(g_game_req_cb, param);
+        return;
+    }
+    game_cb_run(g_game_req_cb, param);
+}
+
+static void cb_fail_run(CCB *self, void *param, uint64_t a, uint64_t b)
+{
+    (void)self; (void)a; (void)b;
+    uint64_t id = *(uint64_t *)param;
+    int err = ((uint8_t *)param)[8];
+    EnterCriticalSection(&g_net_cs);
+    int partner = g_partner && id == g_partner;
+    int active = g_game_state == GAME_ACTIVE;
+    if (partner) g_link_up = 0;
+    LeaveCriticalSection(&g_net_cs);
+    logf_("link: Steam P2P connect FAIL with %llu (error %d)%s", (unsigned long long)id, err,
+          partner && !active ? " -> hidden from game, mod keeps retrying" : "");
+    if (!partner || active) game_cb_run(g_game_fail_cb, param);
+}
+
+static int cb_req_size(CCB *s)  { (void)s; return 8; }
+static int cb_fail_size(CCB *s) { (void)s; return 16; }
+static void *g_my_req_vt[3]  = { (void *)cb_req_run,  (void *)cb_req_run,  (void *)cb_req_size };
+static void *g_my_fail_vt[3] = { (void *)cb_fail_run, (void *)cb_fail_run, (void *)cb_fail_size };
+
+static FARPROC orig_fn(const char *name)
+{
+    HMODULE h = GetModuleHandleA("steam_api64_o.dll");
+    if (!h) {
+        char path[MAX_PATH + 32];
+        snprintf(path, sizeof path, "%ssteam_api64_o.dll", g_dir);
+        h = LoadLibraryA(path);
+    }
+    return h ? GetProcAddress(h, name) : NULL;
+}
+
+__declspec(dllexport) void Proxy_SteamAPI_RegisterCallback(void *cb, int id)
+{
+    static RegCB_t real;
+    if (!real) real = (RegCB_t)orig_fn("SteamAPI_RegisterCallback");
+    CCB *c = (CCB *)cb;
+    if (g_room[0] && (id == 1202 || id == 1203)) {
+        CCB *mine = id == 1202 ? &g_my_req_cb : &g_my_fail_cb;
+        if (id == 1202) g_game_req_cb = c; else g_game_fail_cb = c;
+        c->flags |= 1;     // look registered to the game's own Unregister()
+        c->icb = id;
+        mine->vtbl = id == 1202 ? g_my_req_vt : g_my_fail_vt;
+        real(mine, id);
+        logf_("Steam callback %d (%s) routed through the mod", id, id == 1202 ? "P2PSessionRequest" : "P2PSessionConnectFail");
+        return;
+    }
+    real(cb, id);
+}
+
+__declspec(dllexport) void Proxy_SteamAPI_UnregisterCallback(void *cb)
+{
+    static UnregCB_t real;
+    if (!real) real = (UnregCB_t)orig_fn("SteamAPI_UnregisterCallback");
+    if (cb && (cb == g_game_req_cb || cb == g_game_fail_cb)) {
+        CCB *mine = cb == g_game_req_cb ? &g_my_req_cb : &g_my_fail_cb;
+        if (cb == g_game_req_cb) g_game_req_cb = NULL; else g_game_fail_cb = NULL;
+        ((CCB *)cb)->flags &= (uint8_t)~1;
+        real(mine);
+        return;
+    }
+    real(cb);
+}
+
+// --- own SteamID (ISteamUser019::GetSteamID, vtable slot 2) -----------------
+
+static void ensure_self(void)
+{
+    static int tries;
+    if (g_self || !g_client || tries > 5) return;
+    ++tries;
+    typedef int32_t (*GetH_t)(void);
+    GetH_t gu = (GetH_t)orig_fn("SteamAPI_GetHSteamUser"), gp = (GetH_t)orig_fn("SteamAPI_GetHSteamPipe");
+    if (!gu || !gp) return;
+    int32_t hu = gu(), hp = gp();
+    if (!hu || !hp) return;
+    void *user = ((void *(*)(void *, int32_t, int32_t, const char *))(*(void ***)g_client)[5])(g_client, hu, hp, "SteamUser019");
+    if (!user) return;
+    uint64_t out = 0;
+    uint64_t ret = (uint64_t)((uint64_t (*)(void *, uint64_t *))(*(void ***)user)[2])(user, &out);
+    if (looks_like_steamid(out)) { g_self = out; g_abi_hidden = 1; }
+    else if (looks_like_steamid(ret)) { g_self = ret; g_abi_hidden = 0; }
+    if (g_self) logf_("my SteamID64: %llu", (unsigned long long)g_self);
+    else logf_("could not read my SteamID (lobby partner learning off)");
+}
+
+// --- the pump: runs every frame from SteamAPI_RunCallbacks ----------------------
+
+#pragma pack(push, 1)
+typedef struct { char j, c, kind; uint32_t t; } LinkMsg; // kind 'P' ping, 'O' pong
+#pragma pack(pop)
+
+static void pump(void)
+{
+    if (!g_net || !g_room[0]) return;
+    ensure_self();
+    EnterCriticalSection(&g_net_cs);
+    DWORD now = GetTickCount();
+    uint64_t partner = g_partner;
+
+    if (partner && now - g_last_ping >= 1000) {
+        LinkMsg m = { 'J', 'C', 'P', now };
+        R_SEND(partner, &m, sizeof m, 0 /* unreliable */, LINK_CH);
+        g_last_ping = now;
+    }
+
+    uint32_t sz, got;
+    uint64_t from;
+    LinkMsg m;
+    while (R_AVAIL(&sz, LINK_CH)) {
+        if (!R_READ(&m, sizeof m, &got, &from, LINK_CH)) break;
+        if (from != partner || got != sizeof m || m.j != 'J' || m.c != 'C') continue;
+        g_last_heard = now;
+        if (!g_link_up) {
+            g_link_up = 1;
+            g_link_since = now;
+            logf_("link UP with partner %llu (route warm)", (unsigned long long)from);
+        }
+        if (m.kind == 'P') {
+            LinkMsg r = { 'J', 'C', 'O', m.t };
+            R_SEND(from, &r, sizeof r, 0, LINK_CH);
+        } else if (m.kind == 'O' && now - g_last_rtt_log >= 30000) {
+            g_last_rtt_log = now;
+            logf_("link: ping %lu ms", (unsigned long)(now - m.t));
+        }
+    }
+    if (g_link_up && now - g_last_heard > 8000) {
+        g_link_up = 0;
+        logf_("link DOWN (no ping for 8 s, partner closed the game or network trouble); retrying");
+    }
+
+    // While the game is not connected to the partner, hold back the partner's
+    // game packets and tell the game a new session is being requested.
+    if (partner && g_game_state == GAME_IDLE) {
+        for (int ch = 0; ch < GAME_CHANNELS; ++ch) {
+            while (g_qn < QMAX && R_AVAIL(&sz, ch)) {
+                uint8_t *buf = (uint8_t *)malloc(sz ? sz : 1);
+                if (!buf) break;
+                if (!R_READ(buf, sz, &got, &from, ch)) { free(buf); break; }
+                if (from != partner || now - g_closed_at < 3000) { free(buf); continue; } // stranger / stale
+                g_q[g_qn].from = from; g_q[g_qn].n = got; g_q[g_qn].ch = ch; g_q[g_qn].data = buf;
+                ++g_qn;
+            }
+        }
+        if (g_notified && now - g_notified_at > 5000) {
+            logf_("link: game did not accept the partner within 5 s, dropping %d held packets", g_qn);
+            g_notified = 0;
+            q_clear();
+        }
+        if (g_qn && !g_notified) {
+            g_notified = 1;
+            g_notified_at = now;
+            LeaveCriticalSection(&g_net_cs);
+            logf_("link: partner's game is connecting (%d packets held) -> notifying the game", g_qn);
+            uint64_t req = partner;
+            if (g_game_req_cb) game_cb_run(g_game_req_cb, &req);
+            else logf_("WARNING: game has no P2PSessionRequest callback registered");
+            return;
+        }
+    }
+    LeaveCriticalSection(&g_net_cs);
+}
+
+typedef void (*RunCallbacks_t)(void);
+__declspec(dllexport) void Proxy_SteamAPI_RunCallbacks(void)
+{
+    static RunCallbacks_t real;
+    if (!real) real = (RunCallbacks_t)orig_fn("SteamAPI_RunCallbacks");
+    pump();
+    real();
+}
+
+// --- game-facing hooks ----------------------------------------------------
+
 static uint32_t g_type_seen; // bit (type*8 + ch) for ch < 8
+
 static int8_t h_SendP2P(void *self, uint64_t to, const void *data, uint32_t n, int type, int ch)
 {
+    (void)self;
     if (!allowed(to)) { note_peer(to, "send"); return 0; }
-
     if (type >= 0 && type < 4 && ch >= 0 && ch < 8) {
         uint32_t bit = 1u << (type * 8 + ch);
         if (!(g_type_seen & bit)) {
@@ -362,85 +629,122 @@ static int8_t h_SendP2P(void *self, uint64_t to, const void *data, uint32_t n, i
             logf_("game sends type %d on channel %d (e.g. %u bytes)", type, ch, n);
         }
     }
-
-    int t = type == P2P_UnreliableNoDelay ? P2P_Unreliable : type;
-    EnterCriticalSection(&g_peer_cs);
-    Peer *p = peer_get(to);
-    DWORD now = GetTickCount();
-    if (!p->first_send) {
-        p->first_send = now ? now : 1;
-        logf_("link: first packet to %llu, warm-up on (reliable until they answer)", (unsigned long long)to);
+    EnterCriticalSection(&g_net_cs);
+    if (!g_partner) set_partner(to, "game connecting to it");
+    if (to == g_partner && g_game_state != GAME_ACTIVE) {
+        g_game_state = GAME_ACTIVE;
+        logf_("game -> partner session OPEN (game is calling; link %s)", g_link_up ? "warm" : "NOT warm yet");
     }
-    if (!p->first_recv && now - p->first_send < WARMUP_MAX_MS && t == P2P_Unreliable && n <= 1200) {
-        t = P2P_Reliable;
-        p->upgraded++;
-    }
-    LeaveCriticalSection(&g_peer_cs);
-    return o_SendP2P(self, to, data, n, t, ch);
+    LeaveCriticalSection(&g_net_cs);
+    return R_SEND(to, data, n, type, ch);
 }
 
-static void link_heard(uint64_t id)
+static int8_t h_AvailP2P(void *self, uint32_t *size, int ch)
 {
-    EnterCriticalSection(&g_peer_cs);
-    Peer *p = peer_get(id);
-    if (!p->first_recv) {
-        DWORD now = GetTickCount();
-        p->first_recv = now ? now : 1;
-        if (p->first_send)
-            logf_("link: first packet from %llu, %lu ms after our first send (%u packets sent reliable during warm-up)",
-                  (unsigned long long)id, (unsigned long)(now - p->first_send), p->upgraded);
-        else
-            logf_("link: first packet from %llu (they spoke first)", (unsigned long long)id);
-    }
-    LeaveCriticalSection(&g_peer_cs);
+    (void)self;
+    if (ch == LINK_CH) return 0;
+    EnterCriticalSection(&g_net_cs);
+    int held = g_partner && g_game_state == GAME_IDLE && ch < GAME_CHANNELS;
+    int i = g_game_state == GAME_ACTIVE ? q_find(ch) : -1;
+    if (i >= 0) { *size = g_q[i].n; LeaveCriticalSection(&g_net_cs); return 1; }
+    LeaveCriticalSection(&g_net_cs);
+    if (held) return 0; // partner packets wait in the pump until the game accepts
+    return R_AVAIL(size, ch);
 }
 
 static int8_t h_ReadP2P(void *self, void *buf, uint32_t cb, uint32_t *size, uint64_t *from, int ch)
 {
-    for (int i = 0; i < 64; ++i) {
-        int8_t ok = o_ReadP2P(self, buf, cb, size, from, ch);
+    (void)self;
+    if (ch == LINK_CH) return 0;
+    EnterCriticalSection(&g_net_cs);
+    int held = g_partner && g_game_state == GAME_IDLE && ch < GAME_CHANNELS;
+    int i = g_game_state == GAME_ACTIVE ? q_find(ch) : -1;
+    if (i >= 0) {
+        uint32_t n = g_q[i].n < cb ? g_q[i].n : cb;
+        memcpy(buf, g_q[i].data, n);
+        *size = n;
+        *from = g_q[i].from;
+        q_drop(i);
+        LeaveCriticalSection(&g_net_cs);
+        return 1;
+    }
+    LeaveCriticalSection(&g_net_cs);
+    if (held) return 0;
+    for (int k = 0; k < 64; ++k) {
+        int8_t ok = R_READ(buf, cb, size, from, ch);
         if (!ok) return ok;
         note_peer(*from, "connected");
-        if (allowed(*from)) { link_heard(*from); return ok; }
+        if (allowed(*from)) return ok;
         // drop stranger packet and try the next one
     }
     return 0;
 }
 
-typedef int8_t (*CloseP2P_t)(void *, uint64_t);
-static CloseP2P_t o_CloseP2P;
-static int8_t h_CloseP2P(void *self, uint64_t id)
-{
-    EnterCriticalSection(&g_peer_cs);
-    Peer *p = peer_get(id);
-    DWORD now = GetTickCount();
-    logf_("link: game closed session with %llu (sent for %lu s, heard from them: %s)",
-          (unsigned long long)id, p->first_send ? (unsigned long)((now - p->first_send) / 1000) : 0UL,
-          p->first_recv ? "yes" : "NO");
-    memset(p, 0, sizeof *p); // next session warms up again
-    LeaveCriticalSection(&g_peer_cs);
-    return o_CloseP2P(self, id);
-}
-
 static int8_t h_AcceptP2P(void *self, uint64_t id)
 {
+    (void)self;
     note_peer(id, "session request");
-    if (!allowed(id)) return 0;
-    return o_AcceptP2P(self, id);
+    EnterCriticalSection(&g_net_cs);
+    if (!g_partner) set_partner(id, "game accepted it");
+    if (!allowed(id)) { LeaveCriticalSection(&g_net_cs); return 0; }
+    if (id == g_partner && g_game_state != GAME_ACTIVE) {
+        g_game_state = GAME_ACTIVE;
+        logf_("game <- partner session OPEN (game accepted; link %s, %d packets waiting)",
+              g_link_up ? "warm" : "NOT warm yet", g_qn);
+    }
+    LeaveCriticalSection(&g_net_cs);
+    return R_ACCEPT(id);
+}
+
+static int8_t h_CloseP2P(void *self, uint64_t id)
+{
+    EnterCriticalSection(&g_net_cs);
+    if (g_partner && id == g_partner) {
+        if (g_game_state == GAME_ACTIVE)
+            logf_("game closed its session with partner (Steam link kept open, %s)",
+                  g_link_up ? "link up" : "link down");
+        g_game_state = GAME_IDLE;
+        g_notified = 0;
+        g_closed_at = GetTickCount();
+        q_clear();
+        LeaveCriticalSection(&g_net_cs);
+        return 1;
+    }
+    LeaveCriticalSection(&g_net_cs);
+    return ((CloseP2P_t)g_net_orig[NET_Close])(self, id);
+}
+
+// GetLobbyMemberByIndex (matchmaking slot 18) returns a CSteamID; with the MSVC
+// member ABI the result goes through a hidden pointer (2nd argument).
+static uint64_t h_GetLobbyMember(uint64_t self, uint64_t b, uint64_t c, uint64_t d,
+                                 uint64_t e, uint64_t f, uint64_t g, uint64_t h)
+{
+    uint64_t r = ((Any8_t)g_mm_orig[18])(self, b, c, d, e, f, g, h);
+    uint64_t id = 0;
+    if (g_abi_hidden == 1 && b) id = *(uint64_t *)b;
+    else if (g_abi_hidden == 0) id = r;
+    if (id && id != g_self && !g_partner) {
+        EnterCriticalSection(&g_net_cs);
+        set_partner(id, "same lobby");
+        LeaveCriticalSection(&g_net_cs);
+    }
+    return r;
 }
 
 static void hook_networking(void *net)
 {
     static int done; if (done) return; done = 1;
+    g_net = net;
     void **v = *(void ***)net;
     for (int i = 0; i < 22; ++i) patch(v, i, NET_TR[i], &g_net_orig[i]);
-    patch(v, NET_Send,   (void *)h_SendP2P,   (void **)&o_SendP2P);
-    patch(v, NET_Read,   (void *)h_ReadP2P,   (void **)&o_ReadP2P);
-    patch(v, NET_Accept, (void *)h_AcceptP2P, (void **)&o_AcceptP2P);
-    patch(v, 4 /* CloseP2PSessionWithUser */, (void *)h_CloseP2P, (void **)&o_CloseP2P);
-    logf_("ISteamNetworking hooked (warm-up: reliable until partner answers)");
+    void *dummy;
+    patch(v, NET_Send,   (void *)h_SendP2P,   &dummy);
+    patch(v, NET_Avail,  (void *)h_AvailP2P,  &dummy);
+    patch(v, NET_Read,   (void *)h_ReadP2P,   &dummy);
+    patch(v, NET_Accept, (void *)h_AcceptP2P, &dummy);
+    patch(v, NET_Close,  (void *)h_CloseP2P,  &dummy);
+    logf_("ISteamNetworking hooked (permanent partner link on channel %d)", LINK_CH);
 }
-
 // ---------------------------------------------------------------------------
 // ISteamClient017 hooks: catch the matchmaking / networking interfaces
 
@@ -537,6 +841,7 @@ __declspec(dllexport) void *Proxy_SteamInternal_CreateInterface(const char *ver)
     void *r = o_CreateInterface(ver);
     logf_("CreateInterface(%s) -> %p", ver ? ver : "?", r);
     if (r && g_room[0] && ver && strcmp(ver, "SteamClient017") == 0) {
+        g_client = r;
         void **v = *(void ***)r;
         patch(v, CL_GetISteamMatchmaking, (void *)h_GetMM,  (void **)&o_GetMM);
         patch(v, CL_GetISteamNetworking,  (void *)h_GetNet, (void **)&o_GetNet);

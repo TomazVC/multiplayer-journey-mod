@@ -1,0 +1,77 @@
+JOURNEY COOP - jogar o Journey (Steam) sempre com o mesmo amigo
+===============================================================
+
+O que o mod faz
+---------------
+O Journey normalmente junta voce com um desconhecido aleatorio.
+Com o mod, voce e seu amigo usam o mesmo CODIGO DE SALA e o jogo
+so consegue juntar voces dois: desconhecidos nao enxergam a sala de
+voces, e voces nao enxergam a deles.
+
+Nao mexe na Steam nem em outros jogos: so troca um arquivo dentro da
+pasta do Journey (steam_api64.dll) e guarda a original ao lado.
+
+
+INSTALAR (cada um no seu PC)
+----------------------------
+1. Feche o Journey.
+2. Extraia este ZIP em qualquer pasta (ex.: Area de Trabalho).
+3. Clique duas vezes em  install.cmd
+   - Se o Windows mostrar "O Windows protegeu o computador":
+     clique em "Mais informacoes" > "Executar assim mesmo".
+4. Quando pedir o "Codigo da sala", digite um codigo combinado
+   entre voces (ex.: TOMAZEAMIGO42). Tem que ser IGUAL nos dois PCs.
+   So letras e numeros, minimo 4.
+5. Pronto. Aparece "Instalado!".
+
+
+JOGAR JUNTOS
+------------
+1. Os dois abrem o Journey pela Steam normalmente.
+2. Primeira vez: os dois escolhem COMECAR / NOVO JOGO (ou os dois
+   continuam do mesmo capitulo).
+3. Comecem mais ou menos ao mesmo tempo (combinem por voz/WhatsApp).
+4. Andem pra frente. O amigo aparece como outro viajante brilhando.
+   Pode levar de alguns segundos a 1-2 minutos.
+5. Para ter certeza que e o amigo: combinem um "toque" de chamada,
+   ex.: 3 chamadas curtas + 1 longa.
+6. Joguem! Quando um troca de capitulo, o outro tambem tem que ir
+   para o mesmo capitulo para continuarem juntos.
+
+
+PARAR HOJE E CONTINUAR AMANHA
+-----------------------------
+- O Journey salva no comeco de cada capitulo.
+- Parem os dois NO MESMO CAPITULO (o ideal e sair logo depois de
+  entrarem juntos num capitulo novo).
+- No dia seguinte, os dois escolhem CONTINUAR: voltam no comeco do
+  mesmo capitulo e se encontram de novo.
+- Se um avancou e o outro nao: quem ficou para tras joga ate alcancar
+  o capitulo do outro.
+
+
+SE NAO SE ENCONTRAREM
+---------------------
+1. Confiram se o codigo da sala e igual: abram o arquivo
+   journey-coop.ini na pasta do jogo (linha room=...).
+2. Confiram se estao no MESMO capitulo.
+3. Voltem ao menu e reentrem no capitulo, os dois juntos.
+4. Abram journey-coop.log na pasta do jogo:
+   - "ISteamMatchmaking hooked"  = mod ativo
+   - "RequestLobbyList"          = procurando o parceiro
+   - "peer connected: SteamID64 ..." = conectou com alguem
+   Mandem os dois logs para quem esta cuidando do mod.
+5. Se a Steam atualizou o jogo ou voce usou "Verificar integridade",
+   o mod foi removido: rode install.cmd de novo.
+
+Extra (opcional): o log mostra o SteamID64 do parceiro. Coloquem
+esse numero em partner= no journey-coop.ini para que o jogo recuse
+qualquer outra pessoa.
+
+
+DESINSTALAR
+-----------
+Feche o Journey e clique duas vezes em  uninstall.cmd
+Ele devolve o steam_api64.dll e o Vars.lua originais e apaga os
+arquivos do mod. Se algo der errado, na Steam: botao direito em
+Journey > Propriedades > Arquivos instalados > Verificar integridade.

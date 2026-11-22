@@ -19,6 +19,8 @@ jobs:
         with:
           version: 0.17.1
       - run: sudo apt-get install -y zip
+      - name: transport test (simulated lossy network)
+        run: zig cc -O2 -o rtp_test test/rtp_test.c && ./rtp_test
       - run: sh ./build.sh
       - uses: actions/upload-artifact@v4
         with:

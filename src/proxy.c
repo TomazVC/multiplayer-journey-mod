@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
+#include "rtp.h"
 
 // ---------------------------------------------------------------------------
 // config + log
@@ -358,6 +359,36 @@ typedef struct { uint64_t from; uint32_t n; int ch; uint8_t *data; } QPkt;
 static QPkt g_q[QMAX];
 static int  g_qn;
 
+// --- own reliable transport for the game's packets (see rtp.h) ---------------
+#define DATA_CH 8
+static Rtp g_rtp;
+static uint32_t g_q_drops;
+
+static void rtp_tx_cb(void *ctx, const void *frame, uint32_t n)
+{
+    (void)ctx;
+    if (g_partner) R_SEND(g_partner, frame, n, 0 /* unreliable */, DATA_CH);
+}
+
+static void rtp_rx_cb(void *ctx, int ch, const void *data, uint32_t n)
+{
+    (void)ctx;
+    if (g_qn >= QMAX) { ++g_q_drops; return; }
+    uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+    if (!buf) return;
+    memcpy(buf, data, n);
+    g_q[g_qn].from = g_partner; g_q[g_qn].n = n; g_q[g_qn].ch = ch; g_q[g_qn].data = buf;
+    ++g_qn;
+}
+
+static uint32_t new_gen(void)
+{
+    uint32_t g;
+    do { g = (GetTickCount() * 2654435761u) ^ ((uint32_t)rand() << 12) ^ (uint32_t)rand() ^ (uint32_t)g_self; }
+    while (!g || g == g_rtp.dead_gen || g == g_rtp.s_gen);
+    return g;
+}
+
 // per game-session counters (game channels only), for the log
 static uint32_t g_s_sent, g_s_recv;
 static DWORD    g_s_open, g_s_first_recv;
@@ -365,6 +396,7 @@ static int      g_s_checked;
 
 static void session_open(const char *how)
 {
+    rtp_send_reset_at(&g_rtp, new_gen(), GetTickCount());   // fresh stream for this game session
     g_s_sent = g_s_recv = 0;
     g_s_open = GetTickCount();
     g_s_first_recv = 0;
@@ -588,15 +620,41 @@ static void pump(void)
         if (m.kind == 'P') {
             LinkMsg r = { 'J', 'C', 'O', m.t };
             R_SEND(from, &r, sizeof r, 0, LINK_CH);
-        } else if (m.kind == 'O' && now - g_last_rtt_log >= 30000) {
-            g_last_rtt_log = now;
-            logf_("link: ping %lu ms", (unsigned long)(now - m.t));
+        } else if (m.kind == 'O') {
+            uint32_t rtt = now - m.t, rto = rtt * 3 / 2 + 100;
+            g_rtp.rto = rto < 200 ? 200 : rto > 1500 ? 1500 : rto;
+            if (now - g_last_rtt_log >= 30000) {
+                g_last_rtt_log = now;
+                logf_("link: ping %lu ms", (unsigned long)rtt);
+            }
         }
     }
+    // game packets carried by our own transport
+    {
+        static uint8_t fbuf[2048];
+        while (R_AVAIL(&sz, DATA_CH)) {
+            if (!R_READ(fbuf, sizeof fbuf, &got, &from, DATA_CH)) break;
+            if (from != partner) continue;
+            uint32_t before = g_rtp.r_gen;
+            rtp_on_frame(&g_rtp, fbuf, got, now);
+            if (g_rtp.r_gen != before && g_rtp.r_gen)
+                logf_("transport: partner started a new stream (gen %08x)", g_rtp.r_gen);
+        }
+        if (g_rtp.switched) {
+            g_rtp.switched = 0;
+            if (g_game_state == GAME_ACTIVE) {
+                rtp_send_reset_at(&g_rtp, new_gen(), now);
+                logf_("transport: partner restarted its session -> our stream restarted too");
+            }
+        }
+        rtp_tick(&g_rtp, now);
+    }
+
     if (g_game_state == GAME_ACTIVE && !g_s_checked && now - g_s_open > 10000) {
         g_s_checked = 1;
-        logf_("session +10s: game sent %u packets, received %u%s", g_s_sent, g_s_recv,
-              g_s_recv ? "" : "  <-- partner's game packets are NOT arriving");
+        logf_("session +10s: game sent %u packets, received %u%s (retransmits %u, in flight %u)", g_s_sent, g_s_recv,
+              g_s_recv ? "" : "  <-- partner's game packets are NOT arriving",
+              g_rtp.st_retx, g_rtp.s_next - g_rtp.s_una);
     }
     if (g_link_up && now - g_last_heard > 8000) {
         g_link_up = 0;
@@ -620,6 +678,7 @@ static void pump(void)
             logf_("link: game did not accept the partner within 5 s, dropping %d held packets", g_qn);
             g_notified = 0;
             q_clear();
+            rtp_recv_kill(&g_rtp);
         }
         if (g_qn && !g_notified) {
             g_notified = 1;
@@ -665,7 +724,13 @@ static int8_t h_SendP2P(void *self, uint64_t to, const void *data, uint32_t n, i
         g_game_state = GAME_ACTIVE;
         session_open("->");
     }
-    if (to == g_partner && ch != LINK_CH) ++g_s_sent;
+    if (to == g_partner && ch >= 0 && ch < GAME_CHANNELS) {
+        ++g_s_sent;
+        int rc = rtp_send(&g_rtp, ch, data, n, GetTickCount());
+        if (rc == 0) { LeaveCriticalSection(&g_net_cs); return 1; }
+        static int warned;
+        if (warned++ < 5) logf_("transport: send rc %d (%u bytes) -> using Steam directly", rc, n);
+    }
     LeaveCriticalSection(&g_net_cs);
     return R_SEND(to, data, n, type, ch);
 }
@@ -673,7 +738,7 @@ static int8_t h_SendP2P(void *self, uint64_t to, const void *data, uint32_t n, i
 static int8_t h_AvailP2P(void *self, uint32_t *size, int ch)
 {
     (void)self;
-    if (ch == LINK_CH) return 0;
+    if (ch == LINK_CH || ch == DATA_CH) return 0;
     EnterCriticalSection(&g_net_cs);
     int held = g_partner && g_game_state == GAME_IDLE && ch < GAME_CHANNELS;
     int i = g_game_state == GAME_ACTIVE ? q_find(ch) : -1;
@@ -686,7 +751,7 @@ static int8_t h_AvailP2P(void *self, uint32_t *size, int ch)
 static int8_t h_ReadP2P(void *self, void *buf, uint32_t cb, uint32_t *size, uint64_t *from, int ch)
 {
     (void)self;
-    if (ch == LINK_CH) return 0;
+    if (ch == LINK_CH || ch == DATA_CH) return 0;
     EnterCriticalSection(&g_net_cs);
     int held = g_partner && g_game_state == GAME_IDLE && ch < GAME_CHANNELS;
     int i = g_game_state == GAME_ACTIVE ? q_find(ch) : -1;
@@ -747,16 +812,13 @@ static int8_t h_CloseP2P(void *self, uint64_t id)
         g_notified = 0;
         g_closed_at = now;
         q_clear();
-        if (was_active) {
-            // Reset the Steam session too, like the original game does: a fresh
-            // session means a fresh reliable stream (an old, stuck stream was
-            // blocking our packets after a chapter change). The link pings reopen
-            // it within a second, so the route warms again before the next call.
-            ((CloseP2P_t)g_net_orig[NET_Close])(g_net, id);
-            g_link_up = 0;
-            g_last_ping = 0;
-            logf_("Steam session with partner reset; link re-warming");
-        }
+        // End our streams for this session. Leftover packets of the partner's
+        // old session are dropped by generation; the Steam session stays open.
+        if (was_active)
+            logf_("transport: session ended (retransmits %u, stale dropped %u, queue drops %u)",
+                  g_rtp.st_retx, g_rtp.st_stale, g_q_drops);
+        rtp_send_reset(&g_rtp, 0);
+        rtp_recv_kill(&g_rtp);
         LeaveCriticalSection(&g_net_cs);
         return 1;
     }
@@ -785,6 +847,8 @@ static void hook_networking(void *net)
 {
     static int done; if (done) return; done = 1;
     g_net = net;
+    rtp_init(&g_rtp, rtp_tx_cb, rtp_rx_cb, NULL);
+    srand(GetTickCount() ^ GetCurrentProcessId());
     void **v = *(void ***)net;
     for (int i = 0; i < 22; ++i) patch(v, i, NET_TR[i], &g_net_orig[i]);
     void *dummy;
@@ -793,7 +857,7 @@ static void hook_networking(void *net)
     patch(v, NET_Read,   (void *)h_ReadP2P,   &dummy);
     patch(v, NET_Accept, (void *)h_AcceptP2P, &dummy);
     patch(v, NET_Close,  (void *)h_CloseP2P,  &dummy);
-    logf_("ISteamNetworking hooked (permanent partner link on channel %d)", LINK_CH);
+    logf_("ISteamNetworking hooked (permanent partner link on channel %d, game packets on own transport, channel %d)", LINK_CH, DATA_CH);
 }
 // ---------------------------------------------------------------------------
 // ISteamClient017 hooks: catch the matchmaking / networking interfaces

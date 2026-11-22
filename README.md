@@ -47,3 +47,9 @@ journey-coop-backup/   <- cópias da steam_api64.dll e do Vars.lua originais
 O CI (`.github/workflows/release.yml`) compila em todo push. Quando uma tag `v*` é criada, ele publica o ZIP em Releases.
 
 Testado com `Journey.exe` sha256 `16a7c176…788f` e `steam_api64.dll` sha256 `38f6a1dd…9b29`.
+
+## Versões
+
+- **v0.2.0**: corrige a conexão de mão única em longa distância (ex.: Brasil ↔ Itália). Enquanto o parceiro ainda não respondeu, os pacotes vão como *reliable*, então a Steam guarda e entrega quando a rota P2P fica pronta. O log também registra a latência e o motivo de cada desconexão.
+- **v0.1.1**: diagnóstico. O log registra as mensagens do jogo e cada chamada de matchmaking e rede.
+- **v0.1.0**: primeira versão, com código de sala.

@@ -32,6 +32,7 @@ static int      g_log_on = 1;
 static int      g_debug = 1;
 static FILE    *g_log;
 static CRITICAL_SECTION g_log_cs;
+static CRITICAL_SECTION g_peer_cs;
 
 static void logf_(const char *fmt, ...)
 {
@@ -47,6 +48,8 @@ static void logf_(const char *fmt, ...)
 
 static void load_config(HMODULE self)
 {
+    InitializeCriticalSection(&g_log_cs);
+    InitializeCriticalSection(&g_peer_cs);
     GetModuleFileNameA(self, g_dir, MAX_PATH);
     char *slash = strrchr(g_dir, '\\');
     if (slash) slash[1] = 0;
@@ -70,7 +73,6 @@ static void load_config(HMODULE self)
     g_log_on = GetPrivateProfileIntA("coop", "log", 1, ini);
     g_debug  = GetPrivateProfileIntA("coop", "debug", 1, ini);
     if (g_log_on) {
-        InitializeCriticalSection(&g_log_cs);
         snprintf(logpath, sizeof logpath, "%sjourney-coop.log", g_dir);
         g_log = fopen(logpath, "w");
     }
@@ -319,10 +321,78 @@ static void note_peer(uint64_t id, const char *what)
 
 static int allowed(uint64_t id) { return !g_partner || id == g_partner; }
 
+// --- link warm-up -----------------------------------------------------------
+// Long-distance Steam P2P (e.g. Brazil <-> Italy) can take 10-15 s before the
+// route is up. Unreliable packets sent in that window can be thrown away, so the
+// game's handshake reply never reaches the other side and its ~20 s timeout
+// drops the connection (one side sees the other, the other sees nobody).
+// Fix: until we have received something from a peer, every packet to it is sent
+// Reliable (Steam queues it and delivers once the route is up). "NoDelay" sends,
+// which Steam discards when the route isn't ready, become plain Unreliable.
+
+enum { P2P_Unreliable = 0, P2P_UnreliableNoDelay = 1, P2P_Reliable = 2, P2P_ReliableBuffered = 3 };
+#define WARMUP_MAX_MS 60000
+
+typedef struct { uint64_t id; DWORD first_send, first_recv; uint32_t upgraded; } Peer;
+static Peer g_peers[8];
+
+
+static Peer *peer_get(uint64_t id)
+{
+    Peer *free_slot = NULL;
+    for (int i = 0; i < 8; ++i) {
+        if (g_peers[i].id == id) return &g_peers[i];
+        if (!g_peers[i].id && !free_slot) free_slot = &g_peers[i];
+    }
+    if (!free_slot) { free_slot = &g_peers[0]; }
+    memset(free_slot, 0, sizeof *free_slot);
+    free_slot->id = id;
+    return free_slot;
+}
+
+static uint32_t g_type_seen; // bit (type*8 + ch) for ch < 8
 static int8_t h_SendP2P(void *self, uint64_t to, const void *data, uint32_t n, int type, int ch)
 {
     if (!allowed(to)) { note_peer(to, "send"); return 0; }
-    return o_SendP2P(self, to, data, n, type, ch);
+
+    if (type >= 0 && type < 4 && ch >= 0 && ch < 8) {
+        uint32_t bit = 1u << (type * 8 + ch);
+        if (!(g_type_seen & bit)) {
+            g_type_seen |= bit;
+            logf_("game sends type %d on channel %d (e.g. %u bytes)", type, ch, n);
+        }
+    }
+
+    int t = type == P2P_UnreliableNoDelay ? P2P_Unreliable : type;
+    EnterCriticalSection(&g_peer_cs);
+    Peer *p = peer_get(to);
+    DWORD now = GetTickCount();
+    if (!p->first_send) {
+        p->first_send = now ? now : 1;
+        logf_("link: first packet to %llu, warm-up on (reliable until they answer)", (unsigned long long)to);
+    }
+    if (!p->first_recv && now - p->first_send < WARMUP_MAX_MS && t == P2P_Unreliable && n <= 1200) {
+        t = P2P_Reliable;
+        p->upgraded++;
+    }
+    LeaveCriticalSection(&g_peer_cs);
+    return o_SendP2P(self, to, data, n, t, ch);
+}
+
+static void link_heard(uint64_t id)
+{
+    EnterCriticalSection(&g_peer_cs);
+    Peer *p = peer_get(id);
+    if (!p->first_recv) {
+        DWORD now = GetTickCount();
+        p->first_recv = now ? now : 1;
+        if (p->first_send)
+            logf_("link: first packet from %llu, %lu ms after our first send (%u packets sent reliable during warm-up)",
+                  (unsigned long long)id, (unsigned long)(now - p->first_send), p->upgraded);
+        else
+            logf_("link: first packet from %llu (they spoke first)", (unsigned long long)id);
+    }
+    LeaveCriticalSection(&g_peer_cs);
 }
 
 static int8_t h_ReadP2P(void *self, void *buf, uint32_t cb, uint32_t *size, uint64_t *from, int ch)
@@ -331,10 +401,25 @@ static int8_t h_ReadP2P(void *self, void *buf, uint32_t cb, uint32_t *size, uint
         int8_t ok = o_ReadP2P(self, buf, cb, size, from, ch);
         if (!ok) return ok;
         note_peer(*from, "connected");
-        if (allowed(*from)) return ok;
+        if (allowed(*from)) { link_heard(*from); return ok; }
         // drop stranger packet and try the next one
     }
     return 0;
+}
+
+typedef int8_t (*CloseP2P_t)(void *, uint64_t);
+static CloseP2P_t o_CloseP2P;
+static int8_t h_CloseP2P(void *self, uint64_t id)
+{
+    EnterCriticalSection(&g_peer_cs);
+    Peer *p = peer_get(id);
+    DWORD now = GetTickCount();
+    logf_("link: game closed session with %llu (sent for %lu s, heard from them: %s)",
+          (unsigned long long)id, p->first_send ? (unsigned long)((now - p->first_send) / 1000) : 0UL,
+          p->first_recv ? "yes" : "NO");
+    memset(p, 0, sizeof *p); // next session warms up again
+    LeaveCriticalSection(&g_peer_cs);
+    return o_CloseP2P(self, id);
 }
 
 static int8_t h_AcceptP2P(void *self, uint64_t id)
@@ -352,7 +437,8 @@ static void hook_networking(void *net)
     patch(v, NET_Send,   (void *)h_SendP2P,   (void **)&o_SendP2P);
     patch(v, NET_Read,   (void *)h_ReadP2P,   (void **)&o_ReadP2P);
     patch(v, NET_Accept, (void *)h_AcceptP2P, (void **)&o_AcceptP2P);
-    logf_("ISteamNetworking hooked");
+    patch(v, 4 /* CloseP2PSessionWithUser */, (void *)h_CloseP2P, (void **)&o_CloseP2P);
+    logf_("ISteamNetworking hooked (warm-up: reliable until partner answers)");
 }
 
 // ---------------------------------------------------------------------------
